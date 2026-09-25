@@ -154,3 +154,79 @@ would be.
 | I4 | Password stays in the clipboard and other programs read it | Medium | The clipboard is cleared after 20 seconds, but only if it still holds the copied password. |
 | I5 | Generated passwords are predictable | High | They are made with the `secrets` module, not `random`. |
 | I6 | An entry or the vault is deleted by mistake | Low | `delete` asks for confirmation. `init` refuses to overwrite an existing vault. |
+
+## 3. Design decisions
+
+### Language and libraries
+
+I chose Python because it lets me spend the time on the security parts instead of memory
+management. Most of the memory bugs from the lectures (buffer overflows, off-by-one errors,
+missing null terminators) can't happen in normal Python code. The downside is that I have less
+control over memory, so secrets can't be fully wiped (see R1).
+
+- `cryptography`: well maintained and uses OpenSSL underneath. I use its `AESGCM` class. I don't
+  use `Fernet`, because it is AES-128-CBC + HMAC and doesn't support associated data, which I
+  need for the header (V2).
+- `argon2-cffi`: Argon2id is memory-hard, so guessing with GPUs is much more expensive than with
+  PBKDF2. I use the low-level `hash_secret_raw` function to get a raw 32-byte key.
+- `secrets` and `os.urandom` for all random values (salt, nonce, generated passwords).
+- I don't write any crypto myself.
+
+### Crypto scheme
+
+1. On `init`, a random 16-byte salt is generated.
+2. key = Argon2id(master password, salt, time_cost=3, memory_cost=64 MiB, parallelism=4,
+   output 32 bytes)
+3. On every save, a new random 12-byte nonce is generated.
+4. ciphertext = AES-256-GCM(key, nonce, plaintext = entries as JSON, associated data = header)
+5. On load, the same key is derived from the salt in the file. If decryption or the tag check
+   fails, the vault is not opened.
+
+Changing the master password makes a new salt and a new key and re-encrypts everything.
+
+### Vault format
+
+The vault is one JSON file. The header is readable but authenticated. Everything else is inside
+the ciphertext, so an attacker can't even see the entry names or how many entries there are.
+
+```json
+{
+  "header": {
+    "format": "pwm-vault",
+    "version": 1,
+    "kdf": "argon2id",
+    "kdf_params": { "time_cost": 3, "memory_cost": 65536, "parallelism": 4 },
+    "salt": "<base64, 16 bytes>",
+    "cipher": "aes-256-gcm",
+    "nonce": "<base64, 12 bytes>"
+  },
+  "ciphertext": "<base64, encrypted entries + 16-byte GCM tag>"
+}
+```
+
+The header is turned into bytes with `json.dumps(header, sort_keys=True, separators=(",", ":"))`
+and used as the associated data. This way the bytes are always the same when the file is read
+back.
+
+After decryption, the plaintext looks like this:
+
+```json
+{
+  "entries": {
+    "github": {
+      "username": "javid",
+      "password": "...",
+      "notes": "",
+      "created": "2026-09-25T18:00:00Z",
+      "modified": "2026-09-25T18:00:00Z"
+    }
+  }
+}
+```
+
+The `version` field is there so the format can change later without breaking old vaults.
+
+I also considered SQLite with encrypted fields. I didn't choose it because entry names and the
+number of entries would be visible, and it adds more code. Encrypting the whole file is simpler
+and hides more. The downside is that the whole vault is rewritten on every save, which is fine
+for a personal vault with a few hundred entries.
