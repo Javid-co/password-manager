@@ -83,3 +83,74 @@ Saving (after `add`, `update`, `delete`):
 Everything inside the `pwm` process is treated as trusted. Attacks on the machine itself, like
 malware running as the same user or a keylogger, are out of scope. There is more on this in the
 threat model.
+
+## 2. Threat model
+
+I followed the steps from the Week 2 lecture: identify the assets, describe the architecture,
+break the app into parts, then identify, document and rate the threats. The architecture and the
+parts are in section 1, so this section starts with the assets.
+
+### Assets
+
+- A1: the master password
+- A2: the stored credentials (usernames, passwords, notes)
+- A3: the encryption key derived from the master password
+- A4: the vault file itself (it has to stay intact and usable)
+
+### Attackers I considered
+
+- Someone who gets a copy of `vault.json` (stolen laptop, backup, cloud sync folder)
+- Another user on the same machine
+- Someone looking at the screen
+- The user making mistakes (typing something wrong, the program crashing while saving)
+
+Out of scope: malware running as the same user, keyloggers, and someone with root or admin
+access. If the machine is compromised like that, a local password manager can't protect the
+vault.
+
+### Rating
+
+Each threat is rated High, Medium or Low, based on how likely it is and how bad the result
+would be.
+
+### 2.1 Master password
+
+| ID | Threat | Rating | Mitigation |
+|---|---|---|---|
+| M1 | Attacker with a copy of the vault guesses the master password offline (brute force or wordlist) | High | Key is derived with Argon2id (64 MiB memory, 3 iterations), so every guess is slow. A random 16-byte salt per vault stops precomputed tables. `init` requires at least 12 characters. |
+| M2 | Master password is visible while typing | Low | Read with `getpass`, so it is not echoed. |
+| M3 | Master password ends up in shell history or the process list | Medium | There is no option to pass it as an argument. It is only read from the prompt. |
+| M4 | Master password or key leaks through an error message or traceback | Medium | Exceptions are caught at the top of the program and only a short generic message is printed. Nothing secret is logged. |
+| M5 | Error messages tell an attacker whether the password was wrong or the file was changed | Low | The same message is printed for both: "could not unlock vault". |
+
+### 2.2 Vault at rest
+
+| ID | Threat | Rating | Mitigation |
+|---|---|---|---|
+| V1 | Someone reads the vault file | High | All entries are encrypted with AES-256-GCM. Only the salt, nonce and KDF settings are stored in plain text, and they are not secret. |
+| V2 | Someone modifies the vault file (ciphertext or header) | High | GCM authenticates the ciphertext. The header (version, salt, KDF settings) is passed as associated data, so changing it also makes decryption fail. |
+| V3 | Attacker lowers the KDF settings in the header to make guessing faster | Medium | The program refuses to open a vault with settings below the minimum values it uses itself. |
+| V4 | The same nonce is used twice with the same key, which breaks GCM | High | A new random 12-byte nonce is made with `os.urandom` on every save. |
+| V5 | Another user on the machine reads the file | Medium | The vault folder is created with mode 0700 and the file with 0600. |
+| V6 | The program crashes while saving and leaves a broken vault | Medium | It writes to a temporary file in the same folder, calls `fsync`, and then uses `os.replace`, which is atomic. The old vault stays until the new one is complete. |
+| V7 | Symlink attack: the vault or temp file path is replaced with a link to another file (Week 3) | Medium | The temp file is created with `tempfile.mkstemp` (uses `O_CREAT \| O_EXCL`). Before opening, the vault path is checked with `os.lstat` and rejected if it is a symlink. On Linux it is opened with `O_NOFOLLOW`. |
+| V8 | An older copy of the vault is put back (rollback) | Low | Not fully prevented. The old copy still needs the master password, so the attacker only gets old data back. I accept this risk for this project. |
+
+### 2.3 Vault in memory
+
+| ID | Threat | Rating | Mitigation |
+|---|---|---|---|
+| R1 | Key and decrypted entries stay in memory longer than needed | Medium | Each command unlocks, does its job and exits, so secrets only live for the length of one command. The key is kept in a `bytearray` and overwritten with zeros when done. Python strings can't be wiped, so this is only partly possible. That limitation is accepted. |
+| R2 | Secrets are written to disk in a crash dump | Low | On Linux, core dumps are disabled at startup with `resource.setrlimit(RLIMIT_CORE, 0)`. |
+| R3 | Secrets appear in a traceback on screen | Medium | Same as M4: exceptions are handled at the top level and tracebacks are not shown to the user. |
+
+### 2.4 Interface (CLI)
+
+| ID | Threat | Rating | Mitigation |
+|---|---|---|---|
+| I1 | Bad or very long input (entry names, field values, numbers) causes errors or unexpected behaviour | Medium | Input is validated with an allow-list (Week 4). Entry names must match `[A-Za-z0-9._@-]{1,64}`. Other fields have a maximum length. `--length` must be a number between 8 and 128. Anything else is rejected. |
+| I2 | Path traversal through a custom vault path (`../`) | Medium | The vault path is turned into an absolute path with `os.path.realpath` and must end in `.json`. It is only opened after this check. |
+| I3 | Password shown on screen | Low | `get` hides the password by default. It is only printed with `--show`. |
+| I4 | Password stays in the clipboard and other programs read it | Medium | The clipboard is cleared after 20 seconds, but only if it still holds the copied password. |
+| I5 | Generated passwords are predictable | High | They are made with the `secrets` module, not `random`. |
+| I6 | An entry or the vault is deleted by mistake | Low | `delete` asks for confirmation. `init` refuses to overwrite an existing vault. |
