@@ -150,7 +150,7 @@ would be.
 |---|---|---|---|
 | I1 | Bad or very long input (entry names, field values, numbers) causes errors or unexpected behaviour | Medium | Input is validated with an allow-list (Week 4). Entry names must match `[A-Za-z0-9._@-]{1,64}`. Other fields have a maximum length. `--length` must be a number between 8 and 128. Anything else is rejected. |
 | I2 | Path traversal through a custom vault path (`../`) | Medium | The vault path is turned into an absolute path with `os.path.realpath` and must end in `.json`. It is only opened after this check. |
-| I3 | Password shown on screen | Low | `get` hides the password by default. It is only printed with `--show`. |
+| I3 | Password shown on screen | Low | The program never prints a password. `get` shows it as `********` and `--copy` puts it on the clipboard instead. (The `--show` option from the first plan was dropped for Checkpoint 2.) |
 | I4 | Password stays in the clipboard and other programs read it | Medium | The clipboard is cleared after 20 seconds, but only if it still holds the copied password. |
 | I5 | Generated passwords are predictable | High | They are made with the `secrets` module, not `random`. |
 | I6 | An entry or the vault is deleted by mistake | Low | `delete` asks for confirmation. `init` refuses to overwrite an existing vault. |
