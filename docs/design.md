@@ -2,7 +2,7 @@
 
 Password manager, ICS0022 Secure Programming. Written for Checkpoint 1 and updated for
 Checkpoint 3 (new parts: validation, access control, audit log, secure memory, threats A1-A4,
-L1-L3 and M6).
+L1-L4 and M6).
 
 ## 1. Architecture
 
