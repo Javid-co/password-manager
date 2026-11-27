@@ -8,24 +8,24 @@ L1-L4 and M6).
 
 The program has four main parts:
 
-- **CLI**: parses commands, reads the master password with `getpass` (not echoed) and prints results.
+- CLI: parses commands, reads the master password with `getpass` (not echoed) and prints results.
   All user input goes through here and gets validated before it reaches the other modules.
-- **User management**: handles unlocking the vault, changing the master password and locking
+- User management: handles unlocking the vault, changing the master password and locking
   the vault again when the command finishes. It never stores the master password. A password is
   correct when the vault decrypts successfully.
-- **Encryption module**: derives the key from the master password with Argon2id, and encrypts or
+- Encryption module: derives the key from the master password with Argon2id, and encrypts or
   decrypts the vault with AES-256-GCM. This is the only module that uses the crypto libraries.
-- **Storage layer**: reads and writes the vault file. It does not know anything about the
+- Storage layer: reads and writes the vault file. It does not know anything about the
   contents; it only handles bytes, file permissions and safe writing.
 
 Since Checkpoint 3 there are four smaller helper modules that the main parts use:
 
-- **Validation** (`validate.py`): all input rules in one place. The CLI and the vault both use
+- Validation (`validate.py`): all input rules in one place. The CLI and the vault both use
   it, and the vault also checks the records it decrypts.
-- **Access control** (`access.py`): checks that every file belongs to the current user and that
+- Access control (`access.py`): checks that every file belongs to the current user and that
   nobody else can access it (file modes on Linux, ACLs on Windows).
-- **Audit log** (`audit.py`): writes key events to `pwm.log` as JSON lines, without secrets.
-- **Secure memory** (`secmem.py`): keeps the key in a locked buffer and wipes secrets after use.
+- Audit log (`audit.py`): writes key events to `pwm.log` as JSON lines, without secrets.
+- Secure memory (`secmem.py`): keeps the key in a locked buffer and wipes secrets after use.
 
 ```mermaid
 flowchart LR
@@ -96,11 +96,11 @@ Saving (after `add`, `update`, `delete`):
 
 ### Trust boundaries
 
-1. **User / terminal to CLI.** Everything typed in is untrusted: command names, entry names,
-   lengths. The CLI validates it before passing it on.
-2. **Disk to storage layer.** The vault file can be read, copied, changed, or replaced (for
+1. User / terminal to CLI: everything typed in is untrusted (command names, entry names,
+   lengths). The CLI validates it before passing it on.
+2. Disk to storage layer: the vault file can be read, copied, changed, or replaced (for
    example by a symlink) by someone else. It is not trusted until the GCM tag has been verified.
-3. **Clipboard.** Other programs can read it, so a password only stays there for a short time.
+3. Clipboard: other programs can read it, so a password only stays there for a short time.
 
 Everything inside the `pwm` process is treated as trusted. Attacks on the machine itself, like
 malware running as the same user or a keylogger, are out of scope. There is more on this in the
@@ -212,7 +212,8 @@ control over memory, so secrets can't be fully wiped (see R1).
   use `Fernet`, because it is AES-128-CBC + HMAC and doesn't support associated data, which I
   need for the header (V2).
 - `argon2-cffi`: Argon2id is memory-hard, so guessing with GPUs is much more expensive than with
-  PBKDF2. I use the low-level `hash_secret_raw` function to get a raw 32-byte key.
+  PBKDF2. I call the low-level C function `argon2_hash` directly, so the 32-byte key is written
+  straight into a locked buffer (see R1).
 - `secrets` and `os.urandom` for all random values (salt, nonce, generated passwords).
 - I don't write any crypto myself.
 

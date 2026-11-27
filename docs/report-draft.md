@@ -58,8 +58,8 @@ never used twice with the same key.
 
 The vault file is JSON with a readable header (format, version, KDF settings, salt, nonce) and
 the ciphertext. The header is passed to GCM as associated data, so changing any part of it
-makes decryption fail. No hash of the master password is stored. The vault simply opens if
-GCM decryption works. A wrong password and a changed file give the same error, so the error
+makes decryption fail. No hash of the master password is stored. The vault opens if GCM
+decryption works. A wrong password and a changed file give the same error, so the error
 message doesn't help an attacker.
 
 Before anything is decrypted, the header is checked strictly: exact set of keys, known format
@@ -143,7 +143,7 @@ permissions fixed, input rejected, command cancelled, and unexpected errors.
 
 To keep secrets out, the log only takes event names from a fixed list and fields from a fixed
 list (`reason`, `file`, `count`), and every value has to match a pattern. Anything else is
-written as `"invalid"`. So there is simply no way to log free text. Entry names are not logged
+written as `"invalid"`, so free text can't get into the log. Entry names are not logged
 either, because the vault encrypts them on purpose. The log file is private like the vault.
 If writing the log fails, the command still works and nothing is printed.
 
@@ -170,9 +170,9 @@ Python doesn't give direct control over memory, so I did what is possible:
   copies, wiping can never change a string that other code is still using.
 - Core dumps are turned off on Linux.
 
-`wipe()` refuses strings shorter than 2 characters (Python shares those between all code) and
-non-ASCII strings (they are stored differently). Overwriting a shared string would break the
-interpreter, so this limit matters.
+`wipe()` refuses strings shorter than 2 characters and non-ASCII strings. Python shares short
+strings between all code, so overwriting one would break the interpreter, and non-ASCII strings
+are stored in a different layout.
 
 ### 2.8 Testing
 
@@ -221,7 +221,7 @@ memory, interface, access control, logging). The most important ones:
 
 I ran `bandit -r src`. It found 7 low severity issues, and I checked each one:
 
-- B404, B603: `subprocess` is used for the Linux clipboard tools. The command is always one of
+- B404, B603 (twice): `subprocess` is used for the Linux clipboard tools. The command is always one of
   the fixed lists in the code, there is no shell, and the password goes through stdin, not the
   command line. So command injection isn't possible.
 - B105: it read `"password": 1024` as a hard-coded password. It is the maximum length.
@@ -237,43 +237,42 @@ no issues.
 `test_fuzz.py` is a simple fuzzer. It takes a valid vault and changes it at random: flipped
 bits, removed and inserted bytes, cut files, changed header fields with wrong types, 200 000
 levels of nested brackets, and correctly encrypted payloads with the wrong structure. The only
-allowed result is that the vault opens or one of our own errors comes out. One case worth
-mentioning is deep nesting: `json.loads` raises `RecursionError` for it, which is not a JSON
+allowed result is that the vault opens or one of our own errors comes out. Deep nesting needed
+extra handling: `json.loads` raises `RecursionError` for it, which is not a JSON
 error, so without a separate `except` it would have ended as "unexpected error". `storage.py`
 catches it and gives "could not unlock vault" like for any other broken file, and the fuzz test
 checks that.
 
 ### 3.4 What is still not protected
 
-- **Python strings (R1).** Non-ASCII strings can't be wiped, and the JSON encoder and the
+- Python strings (R1): non-ASCII strings can't be wiped, and the JSON encoder and the
   libraries make short-lived copies I can't reach. OpenSSL also keeps its own copy of the AES
   key while it is in use. The secrets only live for the length of one command, which limits
   this.
-- **Rollback (V8).** Someone who can write to the folder can put an older copy of the vault
+- Rollback (V8): someone who can write to the folder can put an older copy of the vault
   back. They still need the master password to read it, so they only gain old data.
-- **Same-user malware.** Anything running as the same user can read the process memory, the
+- Same-user malware: anything running as the same user can read the process memory, the
   clipboard and the keyboard. This was out of scope from the start.
-- **Administrators.** On Windows an administrator can take ownership of any file, and root can
+- Administrators: on Windows an administrator can take ownership of any file, and root can
   read anything on Linux. The private ACL and the 0600 mode don't stop them.
-- **The 2 second delay** only slows someone typing at the prompt. A copied vault file is
+- The 2 second delay only slows someone typing at the prompt. A copied vault file is
   attacked offline, where only Argon2id helps.
-- **Clipboard managers.** On Windows the program asks Windows not to keep the password in the
+- Clipboard managers: on Windows the program asks Windows not to keep the password in the
   clipboard history, but a third party clipboard manager may ignore that.
 
 ## 4. Conclusion
 
-The password manager does what I planned in Checkpoint 1. The vault is encrypted with a modern
-scheme, the master password is never stored, passwords are never printed, and every file
-belongs to and can only be read by its user. Every input field is validated in one place, the
-important events are logged without secrets, and the error messages don't show internals.
+The password manager does what I planned in Checkpoint 1, and all the Checkpoint 2 and 3
+requirements are in. The two parts that took the most work were memory handling and access
+control on Windows.
 
-The part that took the most work was memory handling. Python protects you from buffer
-overflows, but it also makes it hard to remove a secret from memory, because strings are
-immutable and copies are made everywhere. Writing into the objects with `ctypes` works, but only
-with care, and I had to make sure the vault only wipes its own copies.
+Python protects you from buffer overflows, but it also makes it hard to remove a secret from
+memory, because strings are immutable and copies are made everywhere. Writing into the objects
+with `ctypes` works, but only with care, and I had to make sure the vault only wipes its own
+copies.
 
-The Windows access control was also harder than I expected. `chmod 600` has no effect there,
-so I had to read and write ACLs through the Win32 API.
+On Windows `chmod 600` has no effect, so I had to read and write ACLs through the Win32 API.
+That was harder than I expected.
 
 If I continued the project, I would add a counter in the vault header to detect rollback, look
 at moving the decrypted entries into locked memory too, and run a real coverage-guided fuzzer

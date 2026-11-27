@@ -7,7 +7,7 @@ Command-line password manager for the ICS0022 Secure Programming course.
 A local password manager for one user. All entries are stored in one encrypted vault file,
 and the vault is unlocked with a master password.
 
-Planned features:
+Features:
 - create a vault with a master password
 - add, view, edit, list and delete entries (name, username, password, notes)
 - generate random passwords
