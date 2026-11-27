@@ -114,10 +114,10 @@ parts are in section 1, so this section starts with the assets.
 
 ### Assets
 
-- A1: the master password
-- A2: the stored credentials (usernames, passwords, notes)
-- A3: the encryption key derived from the master password
-- A4: the vault file itself (it has to stay intact and usable)
+- the master password
+- the stored credentials (usernames, passwords, notes)
+- the encryption key derived from the master password
+- the vault file itself (it has to stay intact and usable)
 
 ### Attackers I considered
 
@@ -171,7 +171,7 @@ would be.
 
 | ID | Threat | Rating | Mitigation |
 |---|---|---|---|
-| I1 | Bad or very long input (entry names, field values, numbers) causes errors or unexpected behaviour | Medium | Input is validated with an allow-list (Week 4). Entry names must match `[A-Za-z0-9._@-]{1,64}`. `--length` must be a number between 8 and 128 written with ASCII digits. Text fields have a maximum length, are normalised to NFC, and can't contain control characters or invisible Unicode characters (for example U+202E, which reverses text). The same checks run in the CLI, in the vault, and on the records read from a decrypted vault. |
+| I1 | Bad or very long input (entry names, field values, numbers) causes errors or unexpected behaviour | Medium | Input is validated with an allow-list (Week 4). Entry names must match `[A-Za-z0-9._@-]{1,64}`. `--length` must be a number between 8 and 128 written with ASCII digits. Text fields have a maximum length and can't contain control characters or invisible Unicode characters (for example U+202E, which reverses text). Usernames and notes are normalised to NFC. Passwords are not, so they stay exactly as typed. The same checks run in the CLI, in the vault, and on the records read from a decrypted vault. |
 | I2 | Path traversal through a custom vault path (`../`) | Medium | The vault path is turned into an absolute path with `os.path.realpath` and must end in `.json`. It is only opened after this check. |
 | I3 | Password shown on screen | Low | The program never prints a password. `get` shows it as `********` and `--copy` puts it on the clipboard instead. (The `--show` option from the first plan was dropped for Checkpoint 2.) |
 | I4 | Password stays in the clipboard and other programs read it | Medium | The clipboard is cleared after 20 seconds, but only if it still holds the copied password. |

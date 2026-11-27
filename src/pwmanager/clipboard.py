@@ -155,6 +155,7 @@ else:
     def _paste():
         _, paste_cmd, _ = _tools()
         try:
+            # paste_cmd is also a fixed list from _tools(), and there is no shell.
             out = subprocess.run(paste_cmd, capture_output=True, check=True,  # nosec B603
                                  timeout=5)
         except (OSError, subprocess.SubprocessError):

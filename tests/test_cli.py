@@ -116,11 +116,16 @@ def test_change_master(vault, term):
     assert cli.main(["--vault", vault, "list"]) == 0
 
 
-def test_generate_copies_not_prints(term, capsys, tmp_path):
+def test_generate_copies_not_prints(term, capsys, tmp_path, monkeypatch):
+    seen = []
+    # A copy, because the CLI wipes the generated password after use.
+    monkeypatch.setattr(cli.time, "sleep", lambda s: seen.append(private_copy(term.clipboard)))
     assert cli.main(["--vault", str(tmp_path / "v.json"), "generate", "--length", "32"]) == 0
+    assert len(seen) == 1 and len(seen[0]) == 32
     assert term.clipboard is None  # cleared again
     out = capsys.readouterr().out
     assert "copied" in out
+    assert seen[0] not in out
 
 
 def test_add_generate(vault, term, capsys):
@@ -135,7 +140,7 @@ def test_add_generate(vault, term, capsys):
         assert pw not in out
 
 
-@pytest.mark.parametrize("name", ["", "a b", "../etc", "x" * 65, "na;me", "ÃƒÆ’Ã‚Â©"])
+@pytest.mark.parametrize("name", ["", "a b", "../etc", "x" * 65, "na;me", "é"])
 def test_bad_entry_names(vault, name, capsys):
     with pytest.raises(SystemExit) as e:
         cli.main(["--vault", vault, "get", name])

@@ -12,8 +12,8 @@ master password. The program can add, show, list, change and delete entries, gen
 passwords and change the master password. It never prints a password. When you need one, it is
 copied to the clipboard and removed again after 20 seconds.
 
-I kept the list of features short and spent the time on using what we learned in the course
-on a small real program: threat modelling (Week 2), safe file handling (Week 3), input validation
+I kept the list of features short and spent the time on applying what we learned in the course
+to a small real program: threat modelling (Week 2), safe file handling (Week 3), input validation
 (Week 4), error handling (Week 9), protecting secrets (Week 10), multi-user systems (Week 11)
 and static and dynamic analysis (Week 12).
 
@@ -44,7 +44,7 @@ The code is in `src/pwmanager/`, about 1650 lines in 10 modules.
 | `clipboard.py` | Copy and clear the clipboard |
 | `errors.py` | `PwmError`, the base class for our own errors |
 
-A command always goes the same way. The CLI checks the arguments, asks for the master password
+Every command that opens the vault goes the same way. The CLI checks the arguments, asks for the master password
 at a hidden prompt, and the vault module unlocks the vault. The command runs inside a `with`
 block. At the end of the block the vault is locked again: the key and all fields are wiped and
 the file lock is released.
@@ -58,8 +58,8 @@ never used twice with the same key.
 
 The vault file is JSON with a readable header (format, version, KDF settings, salt, nonce) and
 the ciphertext. The header is passed to GCM as associated data, so changing any part of it
-makes decryption fail. No hash of the master password is stored. The vault opens if GCM
-decryption works. A wrong password and a changed file give the same error, so the error
+makes decryption fail. No hash of the master password is stored. The vault only opens if
+GCM decryption works. A wrong password and a changed file give the same error, so the error
 message doesn't help an attacker.
 
 Before anything is decrypted, the header is checked strictly: exact set of keys, known format
@@ -170,9 +170,9 @@ Python doesn't give direct control over memory, so I did what is possible:
   copies, wiping can never change a string that other code is still using.
 - Core dumps are turned off on Linux.
 
-`wipe()` refuses strings shorter than 2 characters and non-ASCII strings. Python shares short
-strings between all code, so overwriting one would break the interpreter, and non-ASCII strings
-are stored in a different layout.
+`wipe()` refuses strings shorter than 2 characters and non-ASCII strings. Python shares the
+empty string and one-character strings between all code, so overwriting one would break the
+interpreter, and non-ASCII strings are stored in a different layout.
 
 ### 2.8 Testing
 
@@ -212,7 +212,7 @@ memory, interface, access control, logging). The most important ones:
 | Symlink attacks | `lstat`, `O_NOFOLLOW`, `O_EXCL` temp files | symlink refused |
 | Other users reading or planting files | owner check and private permissions on every file | A1-A2 tests on both systems |
 | Two commands at once | vault lock | second unlock refused |
-| Password shown on screen | never printed, clipboard cleared after 20 s | output checked in every CLI test |
+| Password shown on screen | never printed, clipboard cleared after 20 s | output checked in the add, get and generate tests |
 | Bad input, escape sequences, look-alike text | `validate.py` in the CLI and the vault | 108 validation tests |
 | Secrets in logs or error messages | allow-list log, generic errors | every command run, all files searched |
 | Secrets left in memory | `SecretBytes`, `wipe()`, own copies wiped on lock | 18 memory tests |

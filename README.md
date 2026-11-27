@@ -64,10 +64,14 @@ Windows (PowerShell):
 git clone https://github.com/Javid-co/password-manager.git
 cd password-manager
 python -m venv .venv
+Set-ExecutionPolicy -Scope Process RemoteSigned -Force
 .venv\Scripts\activate
 pip install .
 pwm init
 ```
+
+The `Set-ExecutionPolicy` line only applies to the open PowerShell window. Without it, Windows
+refuses to run the activate script of the venv.
 
 Linux / macOS:
 
