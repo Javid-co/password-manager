@@ -9,9 +9,12 @@ import binascii
 import json
 import os
 
-from argon2.low_level import Type, hash_secret_raw
+from argon2.low_level import ARGON2_VERSION, ffi, lib
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+from .errors import PwmError
+from .secmem import SecretBytes, wipe, wipe_all
 
 FORMAT = "pwm-vault"
 VERSION = 1
@@ -32,7 +35,7 @@ MIN_KDF_PARAMS = dict(DEFAULT_KDF_PARAMS)
 MAX_KDF_PARAMS = {"time_cost": 20, "memory_cost": 1048576, "parallelism": 16}
 
 
-class VaultError(Exception):
+class VaultError(PwmError):
     """Raised for any problem opening a vault.
 
     The message is the same for a wrong password and a changed file, so the
@@ -77,19 +80,32 @@ def check_kdf_params(params):
 
 
 def derive_key(master_password, salt, params):
-    """Derive the 32-byte AES key from the master password with Argon2id."""
+    """Derive the 32-byte AES key from the master password with Argon2id.
+
+    Returns a SecretBytes. The C function writes the key straight into that
+    buffer, so no extra copy of the key is made in Python. (hash_secret_raw
+    would return the key as bytes and copy the password into a buffer that
+    is freed without being wiped, so it is not used here.)
+    """
     check_kdf_params(params)
     if len(salt) != SALT_LEN:
         raise VaultError()
-    return hash_secret_raw(
-        secret=master_password.encode("utf-8"),
-        salt=salt,
-        time_cost=params["time_cost"],
-        memory_cost=params["memory_cost"],
-        parallelism=params["parallelism"],
-        hash_len=KEY_LEN,
-        type=Type.ID,
-    )
+    secret = master_password.encode("utf-8")
+    key = SecretBytes(KEY_LEN)
+    try:
+        rc = lib.argon2_hash(
+            params["time_cost"], params["memory_cost"], params["parallelism"],
+            ffi.from_buffer(secret), len(secret),
+            ffi.from_buffer(salt), len(salt),
+            ffi.from_buffer(key.buffer()), KEY_LEN,
+            ffi.NULL, 0, lib.Argon2_id, ARGON2_VERSION,
+        )
+    finally:
+        wipe(secret)
+    if rc != lib.ARGON2_OK:
+        key.wipe()
+        raise VaultError()
+    return key
 
 
 def new_salt():
@@ -112,9 +128,21 @@ def encrypt_vault(key, salt, params, payload):
         "cipher": CIPHER,
         "nonce": _b64encode(nonce),
     }
-    plaintext = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    ciphertext = AESGCM(key).encrypt(nonce, plaintext, header_bytes(header))
+    # ensure_ascii (the default) makes the JSON text pure ASCII, so wipe()
+    # can clear it afterwards.
+    text = json.dumps(payload, separators=(",", ":"))
+    plaintext = text.encode("utf-8")
+    try:
+        ciphertext = AESGCM(_key_buffer(key)).encrypt(nonce, plaintext, header_bytes(header))
+    finally:
+        wipe_all(text, plaintext)
     return {"header": header, "ciphertext": _b64encode(ciphertext)}
+
+
+def _key_buffer(key):
+    if isinstance(key, SecretBytes):
+        return key.buffer()
+    return key
 
 
 def read_header(vault):
@@ -145,21 +173,29 @@ def read_header(vault):
 def decrypt_vault(master_password, vault):
     """Open a vault document with the master password.
 
-    Returns (key, salt, params, payload). The key is returned so the vault
-    can be saved again without running Argon2id a second time.
+    Returns (key, salt, params, payload). The key is a SecretBytes and is
+    returned so the vault can be saved again without running Argon2id a
+    second time. The decrypted bytes and the JSON text are wiped here, so
+    after this only the parsed payload holds the entries.
     Raises VaultError if the password is wrong or the file was changed.
     """
     salt, params, nonce = read_header(vault)
     ciphertext = _b64decode(vault["ciphertext"])
     key = derive_key(master_password, salt, params)
+    plaintext = text = None
     try:
-        plaintext = AESGCM(key).decrypt(nonce, ciphertext, header_bytes(vault["header"]))
-    except InvalidTag:
-        raise VaultError() from None
-    try:
-        payload = json.loads(plaintext.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        raise VaultError() from None
-    if not isinstance(payload, dict):
-        raise VaultError()
+        try:
+            plaintext = AESGCM(key.buffer()).decrypt(
+                nonce, ciphertext, header_bytes(vault["header"]))
+            text = plaintext.decode("utf-8")
+            payload = json.loads(text)
+        except (InvalidTag, UnicodeDecodeError, json.JSONDecodeError):
+            raise VaultError() from None
+        if not isinstance(payload, dict):
+            raise VaultError()
+    except BaseException:
+        key.wipe()
+        raise
+    finally:
+        wipe_all(plaintext, text)
     return key, salt, params, payload

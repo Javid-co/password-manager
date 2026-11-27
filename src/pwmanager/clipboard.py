@@ -8,12 +8,16 @@ in the process list (same reason as M3).
 
 import os
 import shutil
-import subprocess
+# Only the fixed commands from _tools() are run, without a shell.
+import subprocess  # nosec B404
 import sys
 import time
 
+from .errors import PwmError
+from .secmem import wipe_all
 
-class ClipboardError(Exception):
+
+class ClipboardError(PwmError):
     pass
 
 
@@ -73,7 +77,11 @@ if os.name == "nt":
         _open()
         try:
             _user32.EmptyClipboard()
-            _set_data(_CF_UNICODETEXT, (text + "\0").encode("utf-16-le"))
+            data = (text + "\0").encode("utf-16-le")
+            try:
+                _set_data(_CF_UNICODETEXT, data)
+            finally:
+                wipe_all(data)
             # Ask Windows to keep the password out of clipboard history
             # (Win+V) and out of the cloud clipboard.
             zero = (0).to_bytes(4, "little")
@@ -129,11 +137,16 @@ else:
         raise ClipboardError("no clipboard tool found (install wl-clipboard, xclip or xsel)")
 
     def _run(cmd, text=""):
+        # cmd is always one of the fixed lists from _tools(), never user input,
+        # and there is no shell, so nothing can be injected into it.
+        data = text.encode("utf-8")
         try:
-            subprocess.run(cmd, input=text.encode("utf-8"), check=True, timeout=5,
+            subprocess.run(cmd, input=data, check=True, timeout=5,  # nosec B603
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except (OSError, subprocess.SubprocessError):
             raise ClipboardError("could not use the clipboard") from None
+        finally:
+            wipe_all(data)
 
     def _copy(text):
         copy_cmd, _, _ = _tools()
@@ -142,10 +155,14 @@ else:
     def _paste():
         _, paste_cmd, _ = _tools()
         try:
-            out = subprocess.run(paste_cmd, capture_output=True, check=True, timeout=5)
+            out = subprocess.run(paste_cmd, capture_output=True, check=True,  # nosec B603
+                                 timeout=5)
         except (OSError, subprocess.SubprocessError):
             return ""
-        return out.stdout.decode("utf-8", "replace")
+        try:
+            return out.stdout.decode("utf-8", "replace")
+        finally:
+            wipe_all(out.stdout)
 
     def _clear():
         copy_cmd, _, clear_cmd = _tools()
@@ -170,7 +187,11 @@ def clear_if_unchanged(text):
         current = _paste()
     except ClipboardError:
         return False
-    if current == text:
-        _clear()
-        return True
-    return False
+    try:
+        if current == text:
+            _clear()
+            return True
+        return False
+    finally:
+        if current is not text:
+            wipe_all(current)
