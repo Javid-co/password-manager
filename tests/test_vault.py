@@ -4,7 +4,9 @@ import pytest
 
 from pwmanager import storage
 from pwmanager.crypto import VaultError
-from pwmanager.vault import Vault
+from pwmanager.errors import PwmError
+from pwmanager.validate import ValidationError
+from pwmanager.vault import EntryError, Vault
 
 MASTER = "a long master password"
 
@@ -29,7 +31,7 @@ def test_wrong_master_password(path):
 
 
 def test_short_master_password(path):
-    with pytest.raises(ValueError):
+    with pytest.raises(ValidationError):
         Vault.create(path, "short")
 
 
@@ -51,23 +53,25 @@ def test_no_password_hash_or_plaintext_on_disk(path):
 def test_lock_wipes_key(path):
     v = Vault.create(path, MASTER)
     key = v._key
+    buf = key.buffer()
     v.lock()
-    assert key == bytearray(len(key))
-    assert v.entries == {}
-    with pytest.raises(VaultError):
+    assert buf == bytearray(32)
+    assert key.wiped
+    assert v._entries == {}
+    with pytest.raises(PwmError):
         v.save()
 
 
 def test_add_get_update_delete(path):
     with Vault.create(path, MASTER) as v:
         v.add("a", "u", "p", "n")
-        with pytest.raises(KeyError):
+        with pytest.raises(EntryError):
             v.add("a", "u", "p", "n")
         v.update("a", password="p2", username=None)
         assert v.get("a")["password"] == "p2"
         assert v.get("a")["username"] == "u"
         v.delete("a")
-        with pytest.raises(KeyError):
+        with pytest.raises(EntryError):
             v.get("a")
 
 
@@ -89,7 +93,7 @@ def test_bad_payload_shape_refused(path, monkeypatch):
     from pwmanager import crypto
 
     with Vault.create(path, MASTER) as v:
-        doc = crypto.encrypt_vault(bytes(v._key), v._salt, v._params, {"entries": []})
+        doc = crypto.encrypt_vault(v._key, v._salt, v._params, {"entries": []})
     storage.write_vault(path, doc)
     with pytest.raises(VaultError):
         Vault.unlock(path, MASTER)

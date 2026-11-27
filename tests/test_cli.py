@@ -1,48 +1,10 @@
-"""CLI tests. getpass, input and the clipboard are replaced with fakes."""
+"""CLI tests. The fakes for getpass, input and the clipboard are in conftest.py."""
 
 import pytest
+from conftest import MASTER, add
 
-from pwmanager import cli, clipboard
-
-MASTER = "a long master password"
-
-
-class FakeTerminal:
-    def __init__(self, monkeypatch):
-        self.secrets = []
-        self.lines = []
-        self.clipboard = None
-        monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": self.secrets.pop(0))
-        monkeypatch.setattr("builtins.input", lambda prompt="": self.lines.pop(0))
-        monkeypatch.setattr(clipboard, "_copy", self._copy)
-        monkeypatch.setattr(clipboard, "_paste", lambda: self.clipboard or "")
-        monkeypatch.setattr(clipboard, "_clear", self._clear)
-        monkeypatch.setattr(cli, "CLIPBOARD_SECONDS", 0)
-
-    def _copy(self, text):
-        self.clipboard = text
-
-    def _clear(self):
-        self.clipboard = None
-
-
-@pytest.fixture
-def term(monkeypatch):
-    return FakeTerminal(monkeypatch)
-
-
-@pytest.fixture
-def vault(tmp_path, term):
-    path = str(tmp_path / "vault.json")
-    term.secrets = [MASTER, MASTER]
-    assert cli.main(["--vault", path, "init"]) == 0
-    return path
-
-
-def add(path, term, name="github", user="javid", pw="Secret-pw-1", notes=""):
-    term.secrets = [MASTER, pw, pw]
-    term.lines = [user, notes]
-    return cli.main(["--vault", path, "add", name])
+from pwmanager import cli
+from pwmanager.secmem import private_copy
 
 
 def test_add_and_get_never_prints_password(vault, term, capsys):
@@ -57,7 +19,8 @@ def test_add_and_get_never_prints_password(vault, term, capsys):
 def test_get_copy_puts_password_on_clipboard_then_clears(vault, term, capsys, monkeypatch):
     add(vault, term)
     seen = []
-    monkeypatch.setattr(cli.time, "sleep", lambda s: seen.append(term.clipboard))
+    # A copy, because the vault wipes its own string when it is locked.
+    monkeypatch.setattr(cli.time, "sleep", lambda s: seen.append(private_copy(term.clipboard)))
     term.secrets = [MASTER]
     assert cli.main(["--vault", vault, "get", "--copy", "github"]) == 0
     assert seen == ["Secret-pw-1"]
@@ -165,13 +128,14 @@ def test_add_generate(vault, term, capsys):
     term.lines = ["javid", ""]
     assert cli.main(["--vault", vault, "add", "--generate", "--length", "16", "site"]) == 0
     from pwmanager.vault import Vault
+    out = capsys.readouterr().out
     with Vault.unlock(vault, MASTER) as v:
         pw = v.get("site")["password"]
-    assert len(pw) == 16
-    assert pw not in capsys.readouterr().out
+        assert len(pw) == 16
+        assert pw not in out
 
 
-@pytest.mark.parametrize("name", ["", "a b", "../etc", "x" * 65, "na;me", "é"])
+@pytest.mark.parametrize("name", ["", "a b", "../etc", "x" * 65, "na;me", "ÃƒÆ’Ã‚Â©"])
 def test_bad_entry_names(vault, name, capsys):
     with pytest.raises(SystemExit) as e:
         cli.main(["--vault", vault, "get", name])
@@ -194,7 +158,7 @@ def test_control_characters_refused(vault, term, capsys):
     term.secrets = [MASTER]
     term.lines = ["user\x1b[2J"]
     assert cli.main(["--vault", vault, "add", "x"]) == 1
-    assert "control characters" in capsys.readouterr().err
+    assert "control or invisible characters" in capsys.readouterr().err
 
 
 def test_no_traceback_on_unexpected_error(vault, term, capsys, monkeypatch):

@@ -1,97 +1,104 @@
 """Command-line interface for pwm.
 
 Everything typed in is untrusted (trust boundary 1 in docs/design.md), so it
-is checked here before it reaches the other modules. Passwords are never
-printed: get and generate copy them to the clipboard instead.
+is checked with the validate module before it reaches the other modules.
+Passwords are never printed: get and generate copy them to the clipboard.
+
+Error handling (M4, L2): only errors we raise on purpose (PwmError) show
+their message. Anything else prints "unexpected error" and is logged by its
+class name only, never with its message, because a library message could
+contain internal details. No traceback is ever shown.
 """
 
 import argparse
 import getpass
-import re
 import secrets
 import string
 import sys
 import time
 
-from . import clipboard, storage
+from . import audit, clipboard, secmem, storage, validate
+from .access import AccessDenied
 from .crypto import VaultError
+from .errors import PwmError
+from .validate import DEFAULT_GEN_LEN, MAX_GEN_LEN, MIN_GEN_LEN, ValidationError
 from .vault import Vault
 
-NAME_RE = re.compile(r"[A-Za-z0-9._@-]{1,64}")
-LENGTH_RE = re.compile(r"[0-9]{1,3}")
-MIN_GEN_LEN, MAX_GEN_LEN, DEFAULT_GEN_LEN = 8, 128, 20
-MAX_USERNAME_LEN = 256
-MAX_PASSWORD_LEN = 1024
-MAX_NOTES_LEN = 1024
 CLIPBOARD_SECONDS = 20
+# M6: wait after a wrong master password, so guessing at the prompt is slow.
+# (Offline guessing is slowed down by Argon2id, see M1.)
+FAIL_DELAY_SECONDS = 2
 
 # argparse itself exits with 2 for bad arguments.
 EXIT_OK, EXIT_ERROR, EXIT_CANCELLED = 0, 1, 130
 
 
-class UserError(Exception):
+class UserError(PwmError):
     """An error with a message that is safe to show to the user."""
 
 
-# ---------------------------------------------------------------- validation (I1)
+# ---------------------------------------------------------------- argparse types
 
-def entry_name(value):
-    if not NAME_RE.fullmatch(value):
-        raise argparse.ArgumentTypeError(
-            "entry name must be 1-64 characters: letters, digits, . _ @ -")
-    return value
-
-
-def gen_length(value):
-    # int() alone would also accept " 20", "2_0" and "+20", so check the text first.
-    if not LENGTH_RE.fullmatch(value) or not MIN_GEN_LEN <= int(value) <= MAX_GEN_LEN:
-        raise argparse.ArgumentTypeError(
-            f"length must be a whole number from {MIN_GEN_LEN} to {MAX_GEN_LEN}")
-    return int(value)
+def _arg_type(check):
+    def convert(value):
+        try:
+            return check(value)
+        except ValidationError as e:
+            raise argparse.ArgumentTypeError(str(e)) from None
+    convert.__name__ = check.__name__
+    return convert
 
 
-def check_field(label, value, max_len):
-    if len(value) > max_len:
-        raise UserError(f"{label} is too long (max {max_len} characters)")
-    if any(ord(c) < 32 or ord(c) == 127 for c in value):
-        raise UserError(f"{label} must not contain control characters")
-    return value
+entry_name = _arg_type(validate.entry_name)
+gen_length = _arg_type(validate.gen_length)
 
 
 # ---------------------------------------------------------------- prompts
 
-def ask(prompt, label, max_len):
-    return check_field(label, input(prompt), max_len)
+def ask(prompt, check):
+    return check(input(prompt))
 
 
-def ask_secret(prompt, label="password", max_len=MAX_PASSWORD_LEN):
-    # M2, M3: only ever read at a hidden prompt.
-    return check_field(label, getpass.getpass(prompt), max_len)
+def ask_secret(prompt, check):
+    """M2, M3: secrets are only ever read at a hidden prompt."""
+    value = getpass.getpass(prompt)
+    try:
+        return check(value)
+    except BaseException:
+        secmem.wipe(value)
+        raise
 
 
-def ask_new_password(label):
-    first = ask_secret(f"{label}: ", label)
-    if not first:
-        raise UserError(f"{label} must not be empty")
-    if ask_secret(f"Repeat {label.lower()}: ", label) != first:
+def ask_new_password(label, check):
+    first = ask_secret(f"{label}: ", lambda v: check(v, label.lower()))
+    second = getpass.getpass(f"Repeat {label.lower()}: ")
+    a, b = first.encode("utf-8"), second.encode("utf-8")
+    try:
+        same = secrets.compare_digest(a, b)
+    finally:
+        secmem.wipe_all(a, b, second)
+    if not same:
+        secmem.wipe(first)
         raise UserError("the passwords do not match")
     return first
 
 
 def confirm(prompt):
-    return input(prompt + " [y/N] ").strip().lower() in ("y", "yes")
+    return ask(prompt + " [y/N] ", validate.answer) in ("y", "yes")
 
 
 # ---------------------------------------------------------------- helpers
 
 def generate_password(length):
     """I5: uses secrets, and makes sure every character class is present."""
+    length = validate.gen_length(length)
     classes = [string.ascii_lowercase, string.ascii_uppercase, string.digits, string.punctuation]
     alphabet = "".join(classes)
     while True:
         pw = "".join(secrets.choice(alphabet) for _ in range(length))
         if all(any(c in cls for c in pw) for cls in classes):
             return pw
+        secmem.wipe(pw)
 
 
 def copy_and_clear(password, what="Password"):
@@ -109,34 +116,52 @@ def copy_and_clear(password, what="Password"):
 
 
 def unlock(args):
-    master = getpass.getpass("Master password: ")
-    return Vault.unlock(args.vault, master)
+    master = ask_secret("Master password: ", validate.master_password_attempt)
+    try:
+        return Vault.unlock(args.vault, master)
+    except VaultError:
+        time.sleep(FAIL_DELAY_SECONDS)
+        raise
+    finally:
+        secmem.wipe(master)
+
+
+def ask_entry_password(args):
+    if args.generate:
+        return generate_password(args.length)
+    return ask_new_password("Password", validate.password)
 
 
 # ---------------------------------------------------------------- commands
+# Everything that uses data from the vault happens inside the with block,
+# because lock() overwrites the strings at the end of it.
 
 def cmd_init(args):
     if storage.exists(args.vault):
         raise UserError("a vault already exists at " + args.vault)
-    print("Choose a master password (at least 12 characters). It cannot be recovered.")
-    master = ask_new_password("Master password")
-    with Vault.create(args.vault, master):
-        pass
+    print(f"Choose a master password (at least {validate.MIN_MASTER_LEN} characters). "
+          "It cannot be recovered.")
+    master = ask_new_password("Master password", validate.master_password)
+    try:
+        with Vault.create(args.vault, master):
+            pass
+    finally:
+        secmem.wipe(master)
     print("Created a new vault at " + args.vault)
 
 
 def cmd_add(args):
     with unlock(args) as v:
-        if args.name in v.entries:
+        if v.exists(args.name):
             raise UserError(f"an entry called '{args.name}' already exists (use update)")
-        username = ask("Username: ", "username", MAX_USERNAME_LEN)
-        if args.generate:
-            password = generate_password(args.length)
-        else:
-            password = ask_new_password("Password")
-        notes = ask("Notes (optional): ", "notes", MAX_NOTES_LEN)
-        v.add(args.name, username, password, notes)
-        v.save()
+        username = ask("Username: ", validate.username)
+        password = ask_entry_password(args)
+        try:
+            notes = ask("Notes (optional): ", validate.notes)
+            v.add(args.name, username, password, notes)
+            v.save()
+        finally:
+            secmem.wipe(password)
     print(f"Added '{args.name}'.")
     if args.generate:
         print("A random password was generated. Use 'pwm get --copy "
@@ -145,43 +170,47 @@ def cmd_add(args):
 
 def cmd_get(args):
     with unlock(args) as v:
-        entry = dict(v.get(args.name))
-    print(f"name:      {args.name}")
-    print(f"username:  {entry.get('username', '')}")
-    print("password:  ******** (hidden, use --copy)")
-    print(f"notes:     {entry.get('notes', '')}")
-    print(f"created:   {entry.get('created', '')}")
-    print(f"modified:  {entry.get('modified', '')}")
-    if args.copy:
-        copy_and_clear(entry.get("password", ""))
+        entry = v.get(args.name)
+        print(f"name:      {args.name}")
+        print(f"username:  {entry['username']}")
+        print("password:  ******** (hidden, use --copy)")
+        print(f"notes:     {entry['notes']}")
+        print(f"created:   {entry['created']}")
+        print(f"modified:  {entry['modified']}")
+        if args.copy:
+            audit.event("entry.copy")
+            copy_and_clear(entry["password"])
 
 
 def cmd_list(args):
     with unlock(args) as v:
-        rows = sorted((name, e.get("username", "")) for name, e in v.entries.items())
-    if not rows:
-        print("The vault is empty.")
-        return
-    width = max(len(name) for name, _ in rows)
-    for name, username in rows:
-        print(f"{name:<{width}}  {username}")
-    print(f"{len(rows)} entr{'y' if len(rows) == 1 else 'ies'}")
+        rows = v.names()
+        if not rows:
+            print("The vault is empty.")
+            return
+        width = max(len(name) for name, _ in rows)
+        for name, username in rows:
+            print(f"{name:<{width}}  {username}")
+        print(f"{len(rows)} entr{'y' if len(rows) == 1 else 'ies'}")
 
 
 def cmd_update(args):
     with unlock(args) as v:
         entry = v.get(args.name)
         print("Press Enter to keep the current value.")
-        username = ask(f"Username [{entry.get('username', '')}]: ", "username", MAX_USERNAME_LEN)
-        if args.generate:
-            password = generate_password(args.length)
-        elif confirm("Change the password?"):
-            password = ask_new_password("New password")
+        username = ask(f"Username [{entry['username']}]: ", validate.username)
+        if args.generate or confirm("Change the password?"):
+            password = ask_entry_password(args)
         else:
             password = None
-        notes = ask("Notes: ", "notes", MAX_NOTES_LEN)
-        v.update(args.name, username=username or None, password=password, notes=notes or None)
-        v.save()
+        try:
+            notes = ask("Notes: ", validate.notes)
+            v.update(args.name, username=username or None, password=password,
+                     notes=notes or None)
+            v.save()
+        finally:
+            if password is not None:
+                secmem.wipe(password)
     print(f"Updated '{args.name}'.")
 
 
@@ -197,13 +226,21 @@ def cmd_delete(args):
 
 
 def cmd_generate(args):
-    copy_and_clear(generate_password(args.length), "Generated password")
+    password = generate_password(args.length)
+    try:
+        audit.event("password.generate")
+        copy_and_clear(password, "Generated password")
+    finally:
+        secmem.wipe(password)
 
 
 def cmd_change_master(args):
     with unlock(args) as v:
-        new = ask_new_password("New master password")
-        v.change_master(new)
+        new = ask_new_password("New master password", validate.master_password)
+        try:
+            v.change_master(new)
+        finally:
+            secmem.wipe(new)
     print("Master password changed. The vault was encrypted again with a new key.")
 
 
@@ -266,24 +303,39 @@ def disable_core_dumps():
         pass
 
 
+def _error(message):
+    print(f"error: {message}", file=sys.stderr)
+    return EXIT_ERROR
+
+
 def main(argv=None):
     disable_core_dumps()
     args = build_parser().parse_args(argv)
 
-    # M4, R3: catch everything, print a short message, never a traceback.
+    # M4, R3, L2: catch everything, print a short message, never a traceback.
     try:
         args.vault = storage.resolve_path(args.vault)
+        audit.setup(args.vault, args.command)
         args.func(args)
         return EXIT_OK
     except VaultError:
-        print("error: could not unlock vault", file=sys.stderr)
-    except (UserError, storage.StorageError, clipboard.ClipboardError, ValueError) as e:
-        print(f"error: {e}", file=sys.stderr)
-    except KeyError as e:
-        print(f"error: {e.args[0]}", file=sys.stderr)
+        # Already logged by the vault. Same message for every reason (M5).
+        return _error("could not unlock vault")
+    except AccessDenied as e:
+        audit.event("access.denied", "denied", reason=type(e).__name__)
+        return _error(e)
+    except ValidationError as e:
+        audit.event("input.rejected", "fail")
+        return _error(e)
+    except PwmError as e:
+        audit.event("error", "fail", reason=type(e).__name__)
+        return _error(e)
     except (KeyboardInterrupt, EOFError):
+        audit.event("command.cancelled", "fail")
         print("\ncancelled", file=sys.stderr)
         return EXIT_CANCELLED
-    except Exception:
-        print("error: unexpected error", file=sys.stderr)
-    return EXIT_ERROR
+    except Exception as e:
+        audit.event("error", "fail", reason=type(e).__name__)
+        return _error("unexpected error")
+    finally:
+        audit.shutdown()
