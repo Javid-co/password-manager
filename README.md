@@ -98,27 +98,46 @@ pwm get github --copy
 ### Running the tests
 
 ```
-pip install -e . pytest
+pip install -e ".[dev]"
 python -m pytest
+bandit -r src
 ```
 
-There are 74 tests. Two of them (file permissions and symlinks) only run on Linux/macOS and are
-skipped on Windows.
+There are 243 tests. A few only run on Linux/macOS (file modes, symlinks) or only on Windows
+(page locking), so on Windows 239 pass and 4 are skipped, and on Linux 242 pass and 1 is skipped.
+
+### Files pwm creates
+
+Next to the vault (by default in `~/.pwmanager/`):
+
+- `vault.json`: the encrypted vault
+- `vault.json.lock`: an empty file that is locked while a command uses the vault
+- `pwm.log`: the audit log, one JSON event per line, never contains secrets
+
+All of them can only be accessed by the user who owns them (0600 on Linux, a private ACL on
+Windows). pwm refuses to use a file that belongs to another user.
 
 ## Project layout
 
 ```
 src/pwmanager/
-  cli.py        commands, prompts, input validation, error handling
-  vault.py      user management: create, unlock, save, change master password
+  cli.py        commands, prompts, error handling
+  vault.py      user management: create, unlock, record operations, change master password
   crypto.py     Argon2id and AES-256-GCM, vault format checks
-  storage.py    reading and writing the vault file safely
+  storage.py    reading and writing the vault file safely, vault lock
+  validate.py   input validation rules for every field
+  access.py     per-user access control (file owner and permissions)
+  audit.py      structured audit log
+  secmem.py     locked key buffer and wiping secrets from memory
   clipboard.py  copy and clear the clipboard
-tests/          pytest tests for each module
-docs/           design document and progress notes
+  errors.py     base error class
+tests/          pytest tests for each module, plus a fuzz test
+docs/           design document, report draft and progress notes
 ```
 
 ## Status
 
 - Checkpoint 1: design and repo setup (done)
 - Checkpoint 2: core features working, see [docs/progress-checkpoint2.md](docs/progress-checkpoint2.md)
+- Checkpoint 3: near-final, see [docs/progress-checkpoint3.md](docs/progress-checkpoint3.md)
+  and the draft report [docs/report-draft.md](docs/report-draft.md)

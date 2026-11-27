@@ -1,10 +1,12 @@
 # Design document
 
-Password manager, ICS0022 Secure Programming, Checkpoint 1.
+Password manager, ICS0022 Secure Programming. Written for Checkpoint 1 and updated for
+Checkpoint 3 (new parts: validation, access control, audit log, secure memory, threats A1-A4,
+L1-L3 and M6).
 
 ## 1. Architecture
 
-The program has four parts:
+The program has four main parts:
 
 - **CLI**: parses commands, reads the master password with `getpass` (not echoed) and prints results.
   All user input goes through here and gets validated before it reaches the other modules.
@@ -15,6 +17,15 @@ The program has four parts:
   decrypts the vault with AES-256-GCM. This is the only module that uses the crypto libraries.
 - **Storage layer**: reads and writes the vault file. It does not know anything about the
   contents; it only handles bytes, file permissions and safe writing.
+
+Since Checkpoint 3 there are four smaller helper modules that the main parts use:
+
+- **Validation** (`validate.py`): all input rules in one place. The CLI and the vault both use
+  it, and the vault also checks the records it decrypts.
+- **Access control** (`access.py`): checks that every file belongs to the current user and that
+  nobody else can access it (file modes on Linux, ACLs on Windows).
+- **Audit log** (`audit.py`): writes key events to `pwm.log` as JSON lines, without secrets.
+- **Secure memory** (`secmem.py`): keeps the key in a locked buffer and wipes secrets after use.
 
 ```mermaid
 flowchart LR
@@ -29,7 +40,11 @@ flowchart LR
     end
 
     disk[(vault.json on disk<br/>salt, nonce, ciphertext)]
+    lock[(vault.json.lock)]
+    log[(pwm.log<br/>events only)]
     clip[[System clipboard]]
+    acc[Access control<br/>owner + permissions]
+    aud[Audit log]
 
     user -- "command + master password" --> cli
     cli --> um
@@ -39,8 +54,13 @@ flowchart LR
     store -- "encrypted bytes" --> enc
     enc -- "encrypted bytes" --> store
     store <--> disk
+    store --> lock
+    store -- "every file open" --> acc
     cli -- "copy password" --> clip
     mem --> cli
+    um -- "events" --> aud
+    cli -- "events" --> aud
+    aud --> log
 ```
 
 ### Data flow
@@ -65,12 +85,14 @@ Saving (after `add`, `update`, `delete`):
 
 | Data | Where | Protected by |
 |---|---|---|
-| Vault (all entries) | `~/.pwmanager/vault.json` | AES-256-GCM, file mode 0600 |
+| Vault (all entries) | `~/.pwmanager/vault.json` | AES-256-GCM, owner only (0600 or private ACL) |
 | Salt, nonce, KDF settings | inside `vault.json`, not encrypted | not secret, but covered by the GCM tag so changes are detected |
-| Encryption key | process memory only | never written to disk, removed when the command ends |
-| Master password | process memory only, only during unlock | never stored anywhere |
-| Decrypted entries | process memory only | removed when the command ends |
+| Encryption key | process memory only, in a `SecretBytes` | locked in RAM, overwritten with zeros when the vault is locked |
+| Master password | process memory only, only during unlock | never stored anywhere, wiped after unlock |
+| Decrypted entries | process memory only | the vault's own copies are wiped when the command ends |
 | Copied password | system clipboard | cleared after 20 seconds |
+| Lock file | `vault.json.lock` | empty, owner only |
+| Audit log | `pwm.log` next to the vault | events only, no secrets, owner only |
 
 ### Trust boundaries
 
@@ -120,8 +142,9 @@ would be.
 | M1 | Attacker with a copy of the vault guesses the master password offline (brute force or wordlist) | High | Key is derived with Argon2id (64 MiB memory, 3 iterations), so every guess is slow. A random 16-byte salt per vault stops precomputed tables. `init` requires at least 12 characters. |
 | M2 | Master password is visible while typing | Low | Read with `getpass`, so it is not echoed. |
 | M3 | Master password ends up in shell history or the process list | Medium | There is no option to pass it as an argument. It is only read from the prompt. |
-| M4 | Master password or key leaks through an error message or traceback | Medium | Exceptions are caught at the top of the program and only a short generic message is printed. Nothing secret is logged. |
+| M4 | Master password or key leaks through an error message or traceback | Medium | Exceptions are caught at the top of the program and only a short generic message is printed. Nothing secret is logged (see L1, L2). |
 | M5 | Error messages tell an attacker whether the password was wrong or the file was changed | Low | The same message is printed for both: "could not unlock vault". |
+| M6 | Someone at the keyboard tries many master passwords | Low | After a wrong password the program waits 2 seconds before it answers, and the failure is logged. Offline guessing is slowed down by Argon2id (M1), not by this. |
 
 ### 2.2 Vault at rest
 
@@ -131,7 +154,7 @@ would be.
 | V2 | Someone modifies the vault file (ciphertext or header) | High | GCM authenticates the ciphertext. The header (version, salt, KDF settings) is passed as associated data, so changing it also makes decryption fail. |
 | V3 | Attacker lowers the KDF settings in the header to make guessing faster | Medium | The program refuses to open a vault with settings below the minimum values it uses itself. |
 | V4 | The same nonce is used twice with the same key, which breaks GCM | High | A new random 12-byte nonce is made with `os.urandom` on every save. |
-| V5 | Another user on the machine reads the file | Medium | The vault folder is created with mode 0700 and the file with 0600. |
+| V5 | Another user on the machine reads the file | Medium | The vault folder is created with mode 0700 and the file with 0600. On Windows the file gets a private ACL. See A1-A2. |
 | V6 | The program crashes while saving and leaves a broken vault | Medium | It writes to a temporary file in the same folder, calls `fsync`, and then uses `os.replace`, which is atomic. The old vault stays until the new one is complete. |
 | V7 | Symlink attack: the vault or temp file path is replaced with a link to another file (Week 3) | Medium | The temp file is created with `tempfile.mkstemp` (uses `O_CREAT \| O_EXCL`). Before opening, the vault path is checked with `os.lstat` and rejected if it is a symlink. On Linux it is opened with `O_NOFOLLOW`. |
 | V8 | An older copy of the vault is put back (rollback) | Low | Not fully prevented. The old copy still needs the master password, so the attacker only gets old data back. I accept this risk for this project. |
@@ -140,7 +163,7 @@ would be.
 
 | ID | Threat | Rating | Mitigation |
 |---|---|---|---|
-| R1 | Key and decrypted entries stay in memory longer than needed | Medium | Each command unlocks, does its job and exits, so secrets only live for the length of one command. The key is kept in a `bytearray` and overwritten with zeros when done. Python strings can't be wiped, so this is only partly possible. That limitation is accepted. |
+| R1 | Key and decrypted entries stay in memory longer than needed | Medium | Each command unlocks, does its job and exits, so secrets only live for the length of one command. The key is in a `SecretBytes` buffer that is locked in RAM (`VirtualLock`/`mlock`, so it is not swapped to disk) and overwritten with zeros on lock. Argon2id writes the key straight into that buffer. The decrypted bytes, the JSON text, the typed passwords and the vault's copies of all fields are overwritten in place with ctypes. What is left: non-ASCII strings, short-lived copies inside the libraries and the JSON encoder, and OpenSSL's own copy of the key. |
 | R2 | Secrets are written to disk in a crash dump | Low | On Linux, core dumps are disabled at startup with `resource.setrlimit(RLIMIT_CORE, 0)`. |
 | R3 | Secrets appear in a traceback on screen | Medium | Same as M4: exceptions are handled at the top level and tracebacks are not shown to the user. |
 
@@ -148,12 +171,33 @@ would be.
 
 | ID | Threat | Rating | Mitigation |
 |---|---|---|---|
-| I1 | Bad or very long input (entry names, field values, numbers) causes errors or unexpected behaviour | Medium | Input is validated with an allow-list (Week 4). Entry names must match `[A-Za-z0-9._@-]{1,64}`. Other fields have a maximum length. `--length` must be a number between 8 and 128. Anything else is rejected. |
+| I1 | Bad or very long input (entry names, field values, numbers) causes errors or unexpected behaviour | Medium | Input is validated with an allow-list (Week 4). Entry names must match `[A-Za-z0-9._@-]{1,64}`. `--length` must be a number between 8 and 128 written with ASCII digits. Text fields have a maximum length, are normalised to NFC, and can't contain control characters or invisible Unicode characters (for example U+202E, which reverses text). The same checks run in the CLI, in the vault, and on the records read from a decrypted vault. |
 | I2 | Path traversal through a custom vault path (`../`) | Medium | The vault path is turned into an absolute path with `os.path.realpath` and must end in `.json`. It is only opened after this check. |
 | I3 | Password shown on screen | Low | The program never prints a password. `get` shows it as `********` and `--copy` puts it on the clipboard instead. (The `--show` option from the first plan was dropped for Checkpoint 2.) |
 | I4 | Password stays in the clipboard and other programs read it | Medium | The clipboard is cleared after 20 seconds, but only if it still holds the copied password. |
 | I5 | Generated passwords are predictable | High | They are made with the `secrets` module, not `random`. |
 | I6 | An entry or the vault is deleted by mistake | Low | `delete` asks for confirmation. `init` refuses to overwrite an existing vault. |
+
+### 2.5 Access control (added in Checkpoint 3)
+
+The vault is for one person, so the "user" here is the operating system account. Each OS user
+has their own vault, and the program makes sure one user can't use or read another user's files.
+
+| ID | Threat | Rating | Mitigation |
+|---|---|---|---|
+| A1 | Another user places or replaces a vault, lock or log file that pwm then uses | Medium | Every file is checked when it is opened: the owner must be the current user (uid on Linux, SID on Windows). If not, pwm refuses with "belongs to another user". On Linux the check uses the open file descriptor, so it checks the file that was really opened. |
+| A2 | Our own files can be read by other users (wrong mode, or the inherited ACL on Windows) | Medium | New files are made private before anything is written to them: 0600 on Linux, an ACL with only the current user on Windows. An existing file with too open permissions is fixed and the fix is logged. A folder the user picked is not changed, only `~/.pwmanager` and folders pwm creates. |
+| A3 | A record operation runs on a locked vault, or by a different user than the one who unlocked it | Low | Every record operation (list, read, add, update, delete, save, change master) starts with `_authorize()`, which refuses in both cases. |
+| A4 | Two pwm commands change the vault at the same time and one change is lost | Low | The vault is locked with `flock` / `msvcrt.locking` on `vault.json.lock` from unlock until the command ends. A second command gets "the vault is being used by another pwm command". |
+
+### 2.6 Logging and error handling (added in Checkpoint 3)
+
+| ID | Threat | Rating | Mitigation |
+|---|---|---|---|
+| L1 | A secret ends up in the log file | High | The log only accepts known event names and known fields, and every value must match a strict pattern. There is no field for free text, so passwords, usernames, notes and error messages can't be logged. Entry names are not logged because the vault hides them on purpose. Tests run every command and check that no secret is in any file. |
+| L2 | An error message shows internal details (paths inside the program, library messages, tracebacks) | Medium | Only errors the program raises on purpose (`PwmError`) show their message. Everything else prints "unexpected error" and is logged with the exception class name only. |
+| L3 | Someone forges log lines with input that contains a newline | Low | Every event is one `json.dumps` line with `ensure_ascii`, and values that don't match their pattern are replaced with "invalid". |
+| L4 | Other users read the log | Low | The log file gets the same checks as the vault (A1, A2). |
 
 ## 3. Design decisions
 
